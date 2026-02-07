@@ -16,12 +16,4 @@ add_executable(disk_part_fmt
 target_compile_definitions(disk_part_fmt PRIVATE
   UNICODE
   _UNICODE
-  _WIN32_DCOM
-)
-
-target_link_libraries(disk_part_fmt PRIVATE
-  ole32
-  oleaut32
-  uuid
-  vdsuuid
 )
