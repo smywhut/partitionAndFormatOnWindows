@@ -11,7 +11,9 @@
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <limits>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -47,6 +49,44 @@ struct CliOptions {
     std::vector<PartitionRequest> partitions;
 };
 
+// 将 UTF-16 宽字符串安全转换为 UTF-8，便于向 std::runtime_error 输出可读信息。
+std::string WideToUtf8(std::wstring_view input) {
+    if (input.empty()) {
+        return {};
+    }
+
+    const int size = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        input.data(),
+        static_cast<int>(input.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+
+    if (size <= 0) {
+        return "<utf8-convert-failed>";
+    }
+
+    std::string result(static_cast<size_t>(size), '\0');
+    const int written = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        input.data(),
+        static_cast<int>(input.size()),
+        result.data(),
+        size,
+        nullptr,
+        nullptr);
+
+    if (written != size) {
+        return "<utf8-convert-failed>";
+    }
+
+    return result;
+}
+
 std::wstring ToLower(std::wstring s) {
     std::transform(s.begin(), s.end(), s.begin(),
         [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
@@ -58,8 +98,18 @@ void CheckHr(HRESULT hr, const std::wstring& message) {
         _com_error err(hr);
         std::wstringstream ss;
         ss << message << L" (hr=0x" << std::hex << hr << L", " << err.ErrorMessage() << L")";
-        throw std::runtime_error(std::string(ss.str().begin(), ss.str().end()));
+        throw std::runtime_error(WideToUtf8(ss.str()));
     }
+}
+
+std::wstring Trim(std::wstring s) {
+    const auto isSpace = [](wchar_t ch) { return std::iswspace(ch) != 0; };
+    const auto begin = std::find_if_not(s.begin(), s.end(), isSpace);
+    const auto end = std::find_if_not(s.rbegin(), s.rend(), isSpace).base();
+    if (begin >= end) {
+        return L"";
+    }
+    return std::wstring(begin, end);
 }
 
 ULONGLONG ParseSizeString(const std::wstring& s) {
@@ -89,7 +139,12 @@ ULONGLONG ParseSizeString(const std::wstring& s) {
         }
     }
 
-    return static_cast<ULONGLONG>(value * static_cast<double>(multiplier));
+    const double bytes = value * static_cast<double>(multiplier);
+    if (bytes > static_cast<double>(std::numeric_limits<ULONGLONG>::max())) {
+        throw std::runtime_error("Size value too large.");
+    }
+
+    return static_cast<ULONGLONG>(bytes);
 }
 
 GUID ParseGuidOrAlias(const std::wstring& value) {
@@ -109,16 +164,48 @@ std::map<std::wstring, std::wstring> ParseKeyValueList(const std::wstring& raw) 
     std::wstringstream ss(raw);
     std::wstring token;
     while (std::getline(ss, token, L',')) {
+        token = Trim(token);
         const auto pos = token.find(L'=');
         if (pos == std::wstring::npos || pos == 0) {
             throw std::runtime_error("Invalid key=value token.");
         }
-        std::wstring key = ToLower(token.substr(0, pos));
-        std::wstring value = token.substr(pos + 1);
+        std::wstring key = ToLower(Trim(token.substr(0, pos)));
+        std::wstring value = Trim(token.substr(pos + 1));
+        if (value.empty()) {
+            throw std::runtime_error("Value in key=value cannot be empty.");
+        }
         kv[key] = value;
     }
     return kv;
 }
+
+// RAII: 确保无论成功或异常退出都能执行 CoUninitialize，避免 COM 环境泄漏。
+class ScopedCoInit {
+public:
+    ScopedCoInit() {
+        CheckHr(CoInitializeEx(nullptr, COINIT_MULTITHREADED), L"CoInitializeEx");
+        initialized_ = true;
+
+        CheckHr(CoInitializeSecurity(nullptr, -1, nullptr, nullptr,
+            RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            nullptr,
+            EOAC_NONE,
+            nullptr), L"CoInitializeSecurity");
+    }
+
+    ~ScopedCoInit() {
+        if (initialized_) {
+            CoUninitialize();
+        }
+    }
+
+    ScopedCoInit(const ScopedCoInit&) = delete;
+    ScopedCoInit& operator=(const ScopedCoInit&) = delete;
+
+private:
+    bool initialized_{ false };
+};
 
 PartitionRequest ParseCreatePart(const std::wstring& raw) {
     PartitionRequest req;
@@ -311,8 +398,14 @@ CComPtr<IVdsDisk> FindDisk(IVdsService* service, DWORD diskNumber) {
     throw std::runtime_error("Target disk not found.");
 }
 
-std::vector<CComPtr<IVdsVolumeMF>> QueryVolumeMFsByDisk(IVdsService* service, VDS_OBJECT_ID diskId) {
-    std::vector<CComPtr<IVdsVolumeMF>> result;
+struct VolumeInfo {
+    VDS_OBJECT_ID id{};
+    CComPtr<IVdsVolumeMF> volumeMf;
+};
+
+// 查询指定磁盘关联的所有卷，返回卷 ID + 格式化接口，方便后续增量比对。
+std::vector<VolumeInfo> QueryVolumeMFsByDisk(IVdsService* service, VDS_OBJECT_ID diskId) {
+    std::vector<VolumeInfo> result;
 
     CComPtr<IEnumVdsObject> enumVolumes;
     CheckHr(service->QueryVolumes(&enumVolumes), L"Query volumes");
@@ -338,7 +431,9 @@ std::vector<CComPtr<IVdsVolumeMF>> QueryVolumeMFsByDisk(IVdsService* service, VD
                 if (extents[i].idDisk == diskId) {
                     CComPtr<IVdsVolumeMF> volumeMf;
                     if (SUCCEEDED(volume->QueryInterface(IID_PPV_ARGS(&volumeMf)))) {
-                        result.push_back(volumeMf);
+                        VDS_VOLUME_PROP volumeProp{};
+                        CheckHr(volume->GetProperties(&volumeProp), L"Get volume properties");
+                        result.push_back(VolumeInfo{ volumeProp.id, volumeMf });
                     }
                     break;
                 }
@@ -370,14 +465,7 @@ int wmain(int argc, wchar_t** argv) {
 
     try {
         const auto opt = ParseArgs(argc, argv);
-
-        CheckHr(CoInitializeEx(nullptr, COINIT_MULTITHREADED), L"CoInitializeEx");
-        CheckHr(CoInitializeSecurity(nullptr, -1, nullptr, nullptr,
-            RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
-            RPC_C_IMP_LEVEL_IMPERSONATE,
-            nullptr,
-            EOAC_NONE,
-            nullptr), L"CoInitializeSecurity");
+        ScopedCoInit coInit;
 
         CComPtr<IVdsService> service = ConnectVdsService();
         CComPtr<IVdsDisk> disk = FindDisk(service, opt.diskNumber);
@@ -391,6 +479,15 @@ int wmain(int argc, wchar_t** argv) {
         }
 
         for (const auto& req : opt.partitions) {
+            // 记录创建分区前已有卷的 ID，后续优先格式化“新卷”而不是简单使用最后一个。
+            VDS_DISK_PROP prop{};
+            CheckHr(disk->GetProperties(&prop), L"Get disk props before partition create");
+            auto volumesBefore = QueryVolumeMFsByDisk(service, prop.id);
+            std::set<VDS_OBJECT_ID> existingVolumeIds;
+            for (const auto& volume : volumesBefore) {
+                existingVolumeIds.insert(volume.id);
+            }
+
             CREATE_PARTITION_PARAMETERS params{};
             BuildCreateParams(req, params);
 
@@ -406,19 +503,25 @@ int wmain(int argc, wchar_t** argv) {
             std::wcout << L"Created partition size=" << req.sizeBytes << L" bytes\n";
 
             if (req.format.has_value()) {
-                VDS_DISK_PROP prop{};
-                CheckHr(disk->GetProperties(&prop), L"Get disk props for format path");
                 auto volumes = QueryVolumeMFsByDisk(service, prop.id);
                 if (volumes.empty()) {
                     throw std::runtime_error("No volume found for formatting. Wait and retry may be needed.");
                 }
+
+                CComPtr<IVdsVolumeMF> targetVolume = volumes.back().volumeMf;
+                for (const auto& volume : volumes) {
+                    if (!existingVolumeIds.contains(volume.id)) {
+                        targetVolume = volume.volumeMf;
+                        break;
+                    }
+                }
+
                 std::wcout << L"Formatting latest volume...\n";
-                FormatVolume(volumes.back(), req.format.value());
+                FormatVolume(targetVolume, req.format.value());
             }
         }
 
         std::wcout << L"Done.\n";
-        CoUninitialize();
         return 0;
     }
     catch (const std::exception& ex) {
