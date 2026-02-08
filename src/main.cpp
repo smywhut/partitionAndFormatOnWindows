@@ -321,27 +321,59 @@ public:
         CComPtr<IWbemClassObject> pclsObj;
         ULONG uReturn = 0;
 
-        while (pEnumerator) {
+        while (true) {
             HRESULT hr = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
             if (uReturn == 0) break;
 
-            // 使用 ATL CComVariant 简化 VARIANT 操作
             CComVariant vtNumber, vtSize, vtModel, vtPartitionStyle, vtIsOffline;
 
-            pclsObj->Get(CComBSTR(L"Number"), 0, &vtNumber, 0, 0);
-            pclsObj->Get(CComBSTR(L"Size"), 0, &vtSize, 0, 0);
-            pclsObj->Get(CComBSTR(L"Model"), 0, &vtModel, 0, 0);
-            pclsObj->Get(CComBSTR(L"PartitionStyle"), 0, &vtPartitionStyle, 0, 0);
-            pclsObj->Get(CComBSTR(L"IsOffline"), 0, &vtIsOffline, 0, 0);
+            pclsObj->Get(L"Number", 0, &vtNumber, 0, 0);
+            pclsObj->Get(L"Size", 0, &vtSize, 0, 0);
+            pclsObj->Get(L"Model", 0, &vtModel, 0, 0);
+            pclsObj->Get(L"PartitionStyle", 0, &vtPartitionStyle, 0, 0);
+            pclsObj->Get(L"IsOffline", 0, &vtIsOffline, 0, 0);
 
-            wcout << L"磁盘 " << V_I4(&vtNumber) << L": ";
-            if (vtModel.vt == VT_BSTR) {
-                wcout << V_BSTR(&vtModel);
+            // ============================
+            // 修复：正确解析 Size 字段
+            // ============================
+            ULONGLONG sizeBytes = 0;
+
+            switch (vtSize.vt) {
+            case VT_UI8:
+                sizeBytes = vtSize.ullVal;
+                break;
+
+            case VT_I8:
+                sizeBytes = (ULONGLONG)vtSize.llVal;
+                break;
+
+            case VT_BSTR:
+                sizeBytes = _wcstoui64(vtSize.bstrVal, nullptr, 10);
+                break;
+
+            default:
+            {
+                // 强制转换为 UI8
+                CComVariant vtConverted;
+                if (SUCCEEDED(VariantChangeType(&vtConverted, &vtSize, 0, VT_UI8))) {
+                    sizeBytes = vtConverted.ullVal;
+                }
+                break;
             }
+            }
+
+            // ============================
+            // 输出磁盘信息
+            // ============================
+            wcout << L"磁盘 " << V_I4(&vtNumber) << L": ";
+
+            if (vtModel.vt == VT_BSTR)
+                wcout << vtModel.bstrVal;
+
             wcout << endl;
 
             wcout << L"  大小: " << fixed << setprecision(2)
-                << (V_UI8(&vtSize) / (1024.0 * 1024.0 * 1024.0)) << L" GB" << endl;
+                << (sizeBytes / (1024.0 * 1024.0 * 1024.0)) << L" GB" << endl;
 
             wcout << L"  分区样式: ";
             switch (V_I4(&vtPartitionStyle)) {
@@ -355,61 +387,89 @@ public:
             wcout << L"  状态: " << (V_BOOL(&vtIsOffline) ? L"离线" : L"在线") << endl;
             wcout << endl;
 
-            // CComVariant 和 CComPtr 会自动清理
-            pclsObj.Release();  // 准备下一次循环
+            pclsObj.Release();
         }
     }
 
-    // 初始化磁盘为 GPT
     bool InitializeAsGPT(int diskNumber) {
         wcout << L"\n🔧 初始化磁盘 " << diskNumber << L" 为 GPT..." << endl;
 
-        wstring diskPath = L"\\\\.\\ROOT\\Microsoft\\Windows\\Storage:MSFT_Disk.Number=" + to_wstring(diskNumber);
+        wstringstream query;
+        query << L"SELECT * FROM MSFT_Disk WHERE Number = " << diskNumber;
 
-        // 获取 MSFT_Disk 类
-        CComPtr<IWbemClassObject> pClass;
-        CComBSTR bstrClassName(L"MSFT_Disk");
-
-        HRESULT hres = wmi.GetServices()->GetObject(
-            bstrClassName,
-            0,
-            NULL,
-            &pClass,
-            NULL
-        );
-
-        if (FAILED(hres)) {
-            wcerr << L"❌ 获取 MSFT_Disk 类失败" << endl;
+        auto pEnumerator = wmi.Query(query.str());
+        if (!pEnumerator) {
+            wcerr << L"❌ 查询磁盘失败" << endl;
             return false;
         }
 
-        // 获取 Initialize 方法
-        CComPtr<IWbemClassObject> pInParamsDefinition;
-        hres = pClass->GetMethod(CComBSTR(L"Initialize"), 0, &pInParamsDefinition, NULL);
-        if (FAILED(hres)) {
-            wcerr << L"❌ 获取 Initialize 方法失败" << endl;
+        CComPtr<IWbemClassObject> pDiskObj;
+        ULONG uReturn = 0;
+        HRESULT hr = pEnumerator->Next(WBEM_INFINITE, 1, &pDiskObj, &uReturn);
+
+        if (uReturn == 0) {
+            wcerr << L"❌ 未找到磁盘 " << diskNumber << endl;
             return false;
         }
 
-        // 创建方法参数实例
-        CComPtr<IWbemClassObject> pInParams;
-        pInParamsDefinition->SpawnInstance(0, &pInParams);
+        CComVariant vtPath;
+        pDiskObj->Get(L"__PATH", 0, &vtPath, 0, 0);
+        if (vtPath.vt != VT_BSTR) {
+            wcerr << L"❌ 无法获取磁盘对象路径 (__PATH)" << endl;
+            return false;
+        }
+        wstring diskPath = vtPath.bstrVal;
 
-        // 设置分区样式为 GPT (2) - 使用 ATL CComVariant
-        CComVariant varPartitionStyle(2L);  // 直接构造 LONG 类型的 VARIANT
-        pInParams->Put(CComBSTR(L"PartitionStyle"), 0, &varPartitionStyle, 0);
-        // CComVariant 析构时自动 VariantClear
+        // Clear()
+        {
+            CComPtr<IWbemClassObject> pClass;
+            hr = wmi.GetServices()->GetObject(CComBSTR(L"MSFT_Disk"), 0, NULL, &pClass, NULL);
 
-        // 执行方法
-        CComPtr<IWbemClassObject> pOutParams;
-        bool result = wmi.ExecMethod(diskPath, L"Initialize", pInParams, pOutParams);
+            CComPtr<IWbemClassObject> pInParamsDef;
+            hr = pClass->GetMethod(L"Clear", 0, &pInParamsDef, NULL);
 
-        if (result) {
-            wcout << L"✓ 磁盘初始化为 GPT 成功" << endl;
+            CComPtr<IWbemClassObject> pInParams;
+            pInParamsDef->SpawnInstance(0, &pInParams);
+
+            CComVariant varRemove(true);
+            pInParams->Put(L"RemoveData", 0, &varRemove, 0);
+
+            CComPtr<IWbemClassObject> pOutParams;
+            if (!wmi.ExecMethod(diskPath, L"Clear", pInParams, pOutParams)) {
+                wcerr << L"❌ Clear() 失败，无法继续初始化" << endl;
+                return false;
+            }
+
+            wcout << L"✓ Clear() 成功" << endl;
         }
 
-        return result;
+        // Initialize()
+        {
+            CComPtr<IWbemClassObject> pClass;
+            hr = wmi.GetServices()->GetObject(CComBSTR(L"MSFT_Disk"), 0, NULL, &pClass, NULL);
+
+            CComPtr<IWbemClassObject> pInParamsDef;
+            hr = pClass->GetMethod(L"Initialize", 0, &pInParamsDef, NULL);
+
+            CComPtr<IWbemClassObject> pInParams;
+            pInParamsDef->SpawnInstance(0, &pInParams);
+
+            CComVariant varStyle(2L);
+            pInParams->Put(L"PartitionStyle", 0, &varStyle, 0);
+
+            CComPtr<IWbemClassObject> pOutParams;
+            if (!wmi.ExecMethod(diskPath, L"Initialize", pInParams, pOutParams)) {
+                wcerr << L"❌ Initialize() 失败" << endl;
+                return false;
+            }
+
+            wcout << L"✓ Initialize(GPT) 成功" << endl;
+        }
+
+        return true;
     }
+
+
 
     // 创建 GPT 分区
     bool CreatePartition(
@@ -713,64 +773,119 @@ CommandLineArgs ParseCommandLine(int argc, wchar_t* argv[]) {
     for (int i = 1; i < argc; i++) {
         wstring arg = argv[i];
 
+        // -------------------------
+        // --disk=N
+        // -------------------------
         if (arg.find(L"--disk=") == 0) {
             args.diskNumber = stoi(arg.substr(7));
         }
+
+        // -------------------------
+        // --gpt
+        // -------------------------
         else if (arg == L"--gpt") {
             args.initGpt = true;
         }
+
+        // -------------------------
+        // --list
+        // -------------------------
         else if (arg == L"--list") {
             args.listDisks = true;
         }
-        else if (arg.find(L"--create-part") == 0) {
-            size_t pos = arg.find(L'=');
-            if (pos != wstring::npos) {
-                wstring params = arg.substr(pos + 1);
+
+        // -------------------------
+        // --create-part [=] params
+        // -------------------------
+        else if (arg == L"--create-part") {
+            // 形式：--create-part size=5G,label=Data
+            if (i + 1 < argc) {
+                wstring params = argv[++i];
                 auto paramMap = ParseParams(params);
 
                 CommandLineArgs::PartitionSpec spec;
 
-                if (paramMap.count(L"size")) {
+                if (paramMap.count(L"size"))
                     spec.size = ParseSizeString(paramMap[L"size"]);
-                }
-                if (paramMap.count(L"offset")) {
+
+                if (paramMap.count(L"offset"))
                     spec.offset = ParseSizeString(paramMap[L"offset"]);
-                }
-                if (paramMap.count(L"label")) {
+
+                if (paramMap.count(L"label"))
                     spec.label = paramMap[L"label"];
-                }
-                if (paramMap.count(L"type")) {
+
+                if (paramMap.count(L"type"))
                     spec.type = paramMap[L"type"];
-                }
 
                 args.partitions.push_back(spec);
             }
         }
-        else if (arg.find(L"--format") == 0) {
-            size_t pos = arg.find(L'=');
-            if (pos != wstring::npos) {
-                wstring params = arg.substr(pos + 1);
+        else if (arg.find(L"--create-part=") == 0) {
+            // 形式：--create-part=size=5G,label=Data
+            wstring params = arg.substr(14);
+            auto paramMap = ParseParams(params);
+
+            CommandLineArgs::PartitionSpec spec;
+
+            if (paramMap.count(L"size"))
+                spec.size = ParseSizeString(paramMap[L"size"]);
+
+            if (paramMap.count(L"offset"))
+                spec.offset = ParseSizeString(paramMap[L"offset"]);
+
+            if (paramMap.count(L"label"))
+                spec.label = paramMap[L"label"];
+
+            if (paramMap.count(L"type"))
+                spec.type = paramMap[L"type"];
+
+            args.partitions.push_back(spec);
+        }
+
+        // -------------------------
+        // --format [=] params
+        // -------------------------
+        else if (arg == L"--format") {
+            if (i + 1 < argc) {
+                wstring params = argv[++i];
                 auto paramMap = ParseParams(params);
 
                 CommandLineArgs::FormatSpec spec;
 
-                if (paramMap.count(L"fs")) {
+                if (paramMap.count(L"fs"))
                     spec.fileSystem = paramMap[L"fs"];
-                }
-                if (paramMap.count(L"vol")) {
+
+                if (paramMap.count(L"vol"))
                     spec.volumeLabel = paramMap[L"vol"];
-                }
-                if (paramMap.count(L"quick")) {
+
+                if (paramMap.count(L"quick"))
                     spec.quickFormat = (paramMap[L"quick"] == L"1" || paramMap[L"quick"] == L"true");
-                }
 
                 args.formats.push_back(spec);
             }
+        }
+        else if (arg.find(L"--format=") == 0) {
+            wstring params = arg.substr(9);
+            auto paramMap = ParseParams(params);
+
+            CommandLineArgs::FormatSpec spec;
+
+            if (paramMap.count(L"fs"))
+                spec.fileSystem = paramMap[L"fs"];
+
+            if (paramMap.count(L"vol"))
+                spec.volumeLabel = paramMap[L"vol"];
+
+            if (paramMap.count(L"quick"))
+                spec.quickFormat = (paramMap[L"quick"] == L"1" || paramMap[L"quick"] == L"true");
+
+            args.formats.push_back(spec);
         }
     }
 
     return args;
 }
+
 
 // ================================
 // 主程序
@@ -874,10 +989,10 @@ int wmain(int argc, wchar_t* argv[]) {
 
     // 初始化为 GPT
     if (args.initGpt) {
-        if (!diskMgr.InitializeAsGPT(args.diskNumber)) {
-            wcerr << L"❌ GPT 初始化失败" << endl;
-            return 1;
-        }
+        //if (!diskMgr.InitializeAsGPT(args.diskNumber)) {
+        //    wcerr << L"❌ GPT 初始化失败" << endl;
+        //    return 1;
+        //}
     }
 
     // 创建分区并格式化
