@@ -1,365 +1,216 @@
 #include <windows.h>
-
-#include <algorithm>
-#include <cwctype>
-#include <cstdint>
-#include <cstdlib>
+#include <mi.h>
 #include <iostream>
-#include <map>
-#include <optional>
-#include <sstream>
-#include <stdexcept>
 #include <string>
-#include <string_view>
-#include <vector>
+#include <thread>
+#include <chrono>
 
-namespace {
+#pragma comment(lib, "mi.lib")
 
-constexpr wchar_t kBasicDataPartitionGuid[] = L"{EBD0A0A2-B9E5-4433-87C0-68B6B72699C7}";
+using namespace std;
 
-struct FormatOptions {
-    std::wstring fs;
-    std::wstring volLabel;
-    bool quick{ true };
+class StorageManager {
+private:
+    MI_Application app;
+    MI_Session session;
+    bool connected = false;
+    const wchar_t* STORAGE_NAMESPACE = L"ROOT\\Microsoft\\Windows\\Storage";
+
+    // 关键：检查 WMI 方法的逻辑返回值
+    void CheckMethodOutput(const MI_Instance* out, const char* methodName) {
+        if (!out) return;
+        MI_Value val;
+        if (MI_Instance_GetElement(out, MI_T("ReturnValue"), &val, nullptr, nullptr, nullptr) == MI_RESULT_OK) {
+            unsigned int ret = val.uint32;
+            if (ret == 0 || ret == 4096) { // 0: 成功, 4096: Job 已启动
+                return;
+            }
+            cerr << "[Logic Error] " << methodName << " failed with ReturnValue: " << ret << endl;
+            if (ret == 40001) cerr << "xxx" << endl;
+            if (ret == 46000) cerr << "nono" << endl;
+            throw runtime_error("Method execution failed");
+        }
+    }
+
+    void WaitForJob(const MI_Instance* jobRef) {
+        if (!jobRef) return;
+        MI_Value idVal;
+        MI_Instance_GetElement(jobRef, MI_T("InstanceID"), &idVal, nullptr, nullptr, nullptr);
+        wcout << L"    [Job " << (idVal.string ? idVal.string : L"Task") << L"] ";
+
+        while (true) {
+            MI_Operation op = MI_OPERATION_NULL;
+            MI_Session_GetInstance(&session, 0, nullptr, STORAGE_NAMESPACE, jobRef, nullptr, &op);
+
+            const MI_Instance* jobInst = nullptr;
+            MI_Boolean more;
+            if (MI_Operation_GetInstance(&op, &jobInst, &more, nullptr, nullptr, nullptr) == MI_RESULT_OK && jobInst) {
+                MI_Value state, percent;
+                MI_Instance_GetElement(jobInst, MI_T("JobState"), &state, nullptr, nullptr, nullptr);
+                MI_Instance_GetElement(jobInst, MI_T("PercentComplete"), &percent, nullptr, nullptr, nullptr);
+
+                wcout << L"\r    [Progress] " << percent.uint16 << L"%" << flush;
+
+                if (state.uint16 == 7) { // 7 = Completed
+                    cout << " [Done]" << endl;
+                    MI_Operation_Close(&op);
+                    break;
+                }
+                if (state.uint16 > 7) {
+                    MI_Operation_Close(&op);
+                    throw runtime_error("Async Job failed");
+                }
+            }
+            MI_Operation_Close(&op);
+            this_thread::sleep_for(chrono::milliseconds(500));
+        }
+    }
+
+public:
+    StorageManager() { memset(&app, 0, sizeof(app)); memset(&session, 0, sizeof(session)); }
+    ~StorageManager() { if (connected) { MI_Session_Close(&session, nullptr, nullptr); MI_Application_Close(&app); } }
+
+    void Connect() {
+        if (MI_Application_InitializeV1(0, nullptr, nullptr, &app) != MI_RESULT_OK) throw runtime_error("MI Init Fail");
+        if (MI_Application_NewSession(&app, nullptr, nullptr, nullptr, nullptr, nullptr, &session) != MI_RESULT_OK) throw runtime_error("Session Fail");
+        connected = true;
+    }
+
+    MI_Instance* GetDisk(int diskNumber) {
+        MI_Operation op = MI_OPERATION_NULL;
+        wstring query = L"SELECT * FROM MSFT_Disk WHERE Number = " + to_wstring(diskNumber);
+        MI_Session_QueryInstances(&session, 0, nullptr, STORAGE_NAMESPACE, MI_T("WQL"), query.c_str(), nullptr, &op);
+
+        const MI_Instance* inst = nullptr;
+        MI_Boolean more;
+        if (MI_Operation_GetInstance(&op, &inst, &more, nullptr, nullptr, nullptr) != MI_RESULT_OK || !inst) throw runtime_error("Disk not found");
+
+        MI_Instance* cloned;
+        MI_Instance_Clone(inst, &cloned);
+        MI_Operation_Close(&op);
+        return cloned;
+    }
+
+    // 新增：清除磁盘所有分区 (相当于 clean)
+    void ClearDisk(MI_Instance* disk) {
+        cout << "Step 1: Cleaning Disk (Removing all data)..." << endl;
+        MI_Operation op = MI_OPERATION_NULL;
+        // 注意：Clear 方法不需要 inputParams
+        MI_Session_Invoke(&session, 0, nullptr, STORAGE_NAMESPACE, MI_T("MSFT_Disk"), MI_T("Clear"), disk, nullptr, nullptr, &op);
+
+        const MI_Instance* out = nullptr;
+        MI_Boolean more;
+        MI_Operation_GetInstance(&op, &out, &more, nullptr, nullptr, nullptr);
+        CheckMethodOutput(out, "Clear");
+
+        MI_Value job;
+        if (MI_Instance_GetElement(out, MI_T("CreatedStorageJob"), &job, nullptr, nullptr, nullptr) == MI_RESULT_OK && job.instance)
+            WaitForJob(job.instance);
+        MI_Operation_Close(&op);
+    }
+
+    MI_Instance* CreatePartition(MI_Instance* disk, ULONGLONG sizeBytes) {
+        cout << "Step 2: Creating Partition..." << endl;
+        MI_Operation classOp = MI_OPERATION_NULL;
+        const MI_Class* diskClass = nullptr;
+        MI_Boolean more;
+        MI_Session_GetClass(&session, 0, nullptr, STORAGE_NAMESPACE, MI_T("MSFT_Disk"), nullptr, &classOp);
+        MI_Operation_GetClass(&classOp, &diskClass, &more, nullptr, nullptr, nullptr);
+
+        MI_Instance* params = nullptr;
+        MI_Application_NewInstanceFromClass(&app, MI_T("MSFT_Disk"), diskClass, &params);
+        MI_Value val;
+        val.uint64 = sizeBytes;
+        MI_Instance_SetElement(params, MI_T("Size"), &val, MI_UINT64, 0);
+        val.boolean = MI_TRUE; // AssignDriveLetter
+        MI_Instance_SetElement(params, MI_T("UseMaximumSize"), &val, MI_BOOLEAN, 0); // 使用全部空间则设为 true
+
+        MI_Operation op = MI_OPERATION_NULL;
+        MI_Session_Invoke(&session, 0, nullptr, STORAGE_NAMESPACE, MI_T("MSFT_Disk"), MI_T("CreatePartition"), disk, params, nullptr, &op);
+
+        const MI_Instance* out = nullptr;
+        MI_Operation_GetInstance(&op, &out, &more, nullptr, nullptr, nullptr);
+        CheckMethodOutput(out, "CreatePartition");
+
+        MI_Value job;
+        if (MI_Instance_GetElement(out, MI_T("CreatedStorageJob"), &job, nullptr, nullptr, nullptr) == MI_RESULT_OK && job.instance)
+            WaitForJob(job.instance);
+
+        MI_Instance_Delete(params);
+        MI_Operation_Close(&op);
+        MI_Operation_Close(&classOp);
+        return GetLatestPartition(disk);
+    }
+
+    MI_Instance* GetLatestPartition(MI_Instance* disk) {
+        MI_Value path;
+        MI_Instance_GetElement(disk, MI_T("Path"), &path, nullptr, nullptr, nullptr);
+        wstring q = L"ASSOCIATORS OF {" + wstring(path.string) + L"} WHERE AssocClass=MSFT_DiskToPartition ResultClass=MSFT_Partition";
+        MI_Operation op = MI_OPERATION_NULL;
+        MI_Session_QueryInstances(&session, 0, nullptr, STORAGE_NAMESPACE, MI_T("WQL"), q.c_str(), nullptr, &op);
+        const MI_Instance* p = nullptr; MI_Instance* lp = nullptr; MI_Boolean m;
+        while (MI_Operation_GetInstance(&op, &p, &m, nullptr, nullptr, nullptr) == MI_RESULT_OK && p) {
+            if (lp) MI_Instance_Delete(lp);
+            MI_Instance_Clone(p, &lp);
+        }
+        MI_Operation_Close(&op);
+        return lp;
+    }
+
+    void FormatPartition(MI_Instance* part, const wstring& fs, const wstring& label) {
+        cout << "Step 3: Formatting Volume..." << endl;
+        MI_Value path;
+        MI_Instance_GetElement(part, MI_T("Path"), &path, nullptr, nullptr, nullptr);
+        wstring q = L"ASSOCIATORS OF {" + wstring(path.string) + L"} WHERE AssocClass=MSFT_PartitionToVolume ResultClass=MSFT_Volume";
+        MI_Operation op = MI_OPERATION_NULL;
+        MI_Session_QueryInstances(&session, 0, nullptr, STORAGE_NAMESPACE, MI_T("WQL"), q.c_str(), nullptr, &op);
+        const MI_Instance* v = nullptr; MI_Boolean m;
+        MI_Operation_GetInstance(&op, &v, &m, nullptr, nullptr, nullptr);
+        if (!v) throw runtime_error("Volume assoc fail");
+
+        MI_Instance* vClone; MI_Instance_Clone(v, &vClone);
+        MI_Operation_Close(&op);
+
+        MI_Operation cop = MI_OPERATION_NULL; const MI_Class* vc = nullptr;
+        MI_Session_GetClass(&session, 0, nullptr, STORAGE_NAMESPACE, MI_T("MSFT_Volume"), nullptr, &cop);
+        MI_Operation_GetClass(&cop, &vc, &m, nullptr, nullptr, nullptr);
+        MI_Instance* p = nullptr;
+        MI_Application_NewInstanceFromClass(&app, MI_T("MSFT_Volume"), vc, &p);
+        MI_Value val;
+        val.string = (MI_Char*)fs.c_str(); MI_Instance_SetElement(p, MI_T("FileSystem"), &val, MI_STRING, 0);
+        val.string = (MI_Char*)label.c_str(); MI_Instance_SetElement(p, MI_T("FileSystemLabel"), &val, MI_STRING, 0);
+        val.boolean = MI_FALSE; MI_Instance_SetElement(p, MI_T("Full"), &val, MI_BOOLEAN, 0);
+
+        MI_Operation fop = MI_OPERATION_NULL;
+        MI_Session_Invoke(&session, 0, nullptr, STORAGE_NAMESPACE, MI_T("MSFT_Volume"), MI_T("Format"), vClone, p, nullptr, &fop);
+        const MI_Instance* fout = nullptr;
+        MI_Operation_GetInstance(&fop, &fout, &m, nullptr, nullptr, nullptr);
+        CheckMethodOutput(fout, "Format");
+
+        MI_Instance_Delete(p); MI_Instance_Delete(vClone);
+        MI_Operation_Close(&fop); MI_Operation_Close(&cop);
+    }
 };
 
-struct PartitionRequest {
-    std::optional<ULONGLONG> offsetBytes;
-    ULONGLONG sizeBytes{ 0 };
-    std::wstring partLabel;
-    std::wstring partType{ kBasicDataPartitionGuid };
-    std::optional<FormatOptions> format;
-};
-
-struct CliOptions {
-    DWORD diskNumber{ 0 };
-    bool gpt{ false };
-    std::vector<PartitionRequest> partitions;
-};
-
-std::string WideToUtf8(std::wstring_view input) {
-    if (input.empty()) {
-        return {};
-    }
-
-    const int size = WideCharToMultiByte(CP_UTF8, 0, input.data(), static_cast<int>(input.size()), nullptr, 0, nullptr, nullptr);
-    if (size <= 0) {
-        return "<utf8-convert-failed>";
-    }
-
-    std::string result(static_cast<size_t>(size), '\0');
-    const int written = WideCharToMultiByte(CP_UTF8, 0, input.data(), static_cast<int>(input.size()), result.data(), size, nullptr, nullptr);
-    if (written != size) {
-        return "<utf8-convert-failed>";
-    }
-    return result;
-}
-
-std::wstring ToLower(std::wstring s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-        [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
-    return s;
-}
-
-std::wstring Trim(std::wstring s) {
-    const auto isSpace = [](wchar_t ch) { return std::iswspace(ch) != 0; };
-    const auto begin = std::find_if_not(s.begin(), s.end(), isSpace);
-    const auto end = std::find_if_not(s.rbegin(), s.rend(), isSpace).base();
-    if (begin >= end) {
-        return L"";
-    }
-    return std::wstring(begin, end);
-}
-
-ULONGLONG ParseSizeString(const std::wstring& s) {
-    if (s.empty()) {
-        throw std::runtime_error("Empty size string.");
-    }
-
-    wchar_t* end = nullptr;
-    const double value = std::wcstod(s.c_str(), &end);
-    if (end == s.c_str() || value <= 0) {
-        throw std::runtime_error("Invalid size value.");
-    }
-
-    ULONGLONG multiplier = 1;
-    if (*end != L'\0') {
-        const wchar_t unit = static_cast<wchar_t>(std::towupper(*end));
-        switch (unit) {
-        case L'K': multiplier = 1024ull; break;
-        case L'M': multiplier = 1024ull * 1024ull; break;
-        case L'G': multiplier = 1024ull * 1024ull * 1024ull; break;
-        case L'T': multiplier = 1024ull * 1024ull * 1024ull * 1024ull; break;
-        default: throw std::runtime_error("Unsupported size unit; use K/M/G/T.");
-        }
-        ++end;
-        if (*end != L'\0') {
-            throw std::runtime_error("Trailing characters after size unit.");
-        }
-    }
-
-    return static_cast<ULONGLONG>(value * static_cast<double>(multiplier));
-}
-
-std::wstring ParseGuidOrAlias(const std::wstring& value) {
-    const std::wstring lower = ToLower(value);
-    if (lower == L"basic" || lower == L"basicdata") {
-        return kBasicDataPartitionGuid;
-    }
-    return value;
-}
-
-std::map<std::wstring, std::wstring> ParseKeyValueList(const std::wstring& raw) {
-    std::map<std::wstring, std::wstring> kv;
-    std::wstringstream ss(raw);
-    std::wstring token;
-    while (std::getline(ss, token, L',')) {
-        token = Trim(token);
-        const auto pos = token.find(L'=');
-        if (pos == std::wstring::npos || pos == 0) {
-            throw std::runtime_error("Invalid key=value token.");
-        }
-        std::wstring key = ToLower(Trim(token.substr(0, pos)));
-        std::wstring value = Trim(token.substr(pos + 1));
-        if (value.empty()) {
-            throw std::runtime_error("Value in key=value cannot be empty.");
-        }
-        kv[key] = value;
-    }
-    return kv;
-}
-
-PartitionRequest ParseCreatePart(const std::wstring& raw) {
-    PartitionRequest req;
-    const auto kv = ParseKeyValueList(raw);
-
-    const auto itSize = kv.find(L"size");
-    if (itSize == kv.end()) {
-        throw std::runtime_error("create-part requires size=...");
-    }
-    req.sizeBytes = ParseSizeString(itSize->second);
-
-    if (const auto itOff = kv.find(L"offset"); itOff != kv.end()) {
-        req.offsetBytes = ParseSizeString(itOff->second);
-    }
-    if (const auto itLabel = kv.find(L"label"); itLabel != kv.end()) {
-        req.partLabel = itLabel->second;
-    }
-    if (const auto itType = kv.find(L"type"); itType != kv.end()) {
-        req.partType = ParseGuidOrAlias(itType->second);
-    }
-
-    return req;
-}
-
-FormatOptions ParseFormat(const std::wstring& raw) {
-    FormatOptions fmt;
-    const auto kv = ParseKeyValueList(raw);
-
-    const auto itFs = kv.find(L"fs");
-    if (itFs == kv.end()) {
-        throw std::runtime_error("format requires fs=ntfs|fat32|exfat");
-    }
-    fmt.fs = ToLower(itFs->second);
-
-    if (const auto itVol = kv.find(L"vol"); itVol != kv.end()) {
-        fmt.volLabel = itVol->second;
-    }
-    if (const auto itQuick = kv.find(L"quick"); itQuick != kv.end()) {
-        fmt.quick = (itQuick->second == L"1" || ToLower(itQuick->second) == L"true");
-    }
-    return fmt;
-}
-
-CliOptions ParseArgs(int argc, wchar_t** argv) {
-    CliOptions opt;
-    for (int i = 1; i < argc; ++i) {
-        std::wstring arg = argv[i];
-
-        if (arg.rfind(L"--disk=", 0) == 0) {
-            opt.diskNumber = static_cast<DWORD>(std::stoul(arg.substr(7)));
-        }
-        else if (arg == L"--gpt") {
-            opt.gpt = true;
-        }
-        else if (arg.rfind(L"--create-part", 0) == 0) {
-            const auto pos = arg.find(L'=');
-            if (pos == std::wstring::npos) {
-                throw std::runtime_error("--create-part requires value list.");
-            }
-            opt.partitions.push_back(ParseCreatePart(arg.substr(pos + 1)));
-        }
-        else if (arg.rfind(L"--format", 0) == 0) {
-            const auto pos = arg.find(L'=');
-            if (pos == std::wstring::npos) {
-                throw std::runtime_error("--format requires value list.");
-            }
-            if (opt.partitions.empty()) {
-                throw std::runtime_error("--format must follow at least one --create-part.");
-            }
-            opt.partitions.back().format = ParseFormat(arg.substr(pos + 1));
-        }
-        else {
-            throw std::runtime_error("Unknown argument.");
-        }
-    }
-
-    if (opt.partitions.empty()) {
-        throw std::runtime_error("At least one --create-part is required.");
-    }
-    return opt;
-}
-
-std::wstring QuotePsSingle(const std::wstring& value) {
-    std::wstring escaped;
-    escaped.reserve(value.size() + 2);
-    escaped.push_back(L'\'');
-    for (wchar_t ch : value) {
-        escaped.push_back(ch);
-        if (ch == L'\'') {
-            escaped.push_back(L'\'');
-        }
-    }
-    escaped.push_back(L'\'');
-    return escaped;
-}
-
-std::wstring ValidateFs(const std::wstring& fs) {
-    if (fs == L"ntfs") {
-        return L"NTFS";
-    }
-    if (fs == L"fat32") {
-        return L"FAT32";
-    }
-    if (fs == L"exfat") {
-        return L"exFAT";
-    }
-    throw std::runtime_error("Unsupported file system type.");
-}
-
-std::wstring BuildSmapiScript(const CliOptions& opt) {
-    std::wstringstream script;
-    script << L"$ErrorActionPreference = 'Stop'\n";
-    script << L"$diskNumber = " << opt.diskNumber << L"\n";
-
-    if (opt.gpt) {
-        script << L"Initialize-Disk -Number $diskNumber -PartitionStyle GPT -Confirm:$false | Out-Null\n";
-    }
-
-    int index = 1;
-    for (const auto& req : opt.partitions) {
-        const std::wstring partitionVar = L"$partition" + std::to_wstring(index++);
-        script << partitionVar << L" = New-Partition -DiskNumber $diskNumber -Size " << req.sizeBytes;
-        if (req.offsetBytes.has_value()) {
-            script << L" -Offset " << req.offsetBytes.value();
-        }
-        script << L" -GptType " << QuotePsSingle(req.partType) << L"\n";
-
-        if (!req.partLabel.empty()) {
-            script << L"Write-Host " << QuotePsSingle(L"[warn] SMAPI/New-Partition 不支持直接设置 GPT 分区名，已忽略 label=" + req.partLabel) << L"\n";
-        }
-
-        if (req.format.has_value()) {
-            const auto& fmt = req.format.value();
-            script << L"Format-Volume -Partition " << partitionVar << L" -FileSystem " << ValidateFs(fmt.fs);
-            if (!fmt.volLabel.empty()) {
-                script << L" -NewFileSystemLabel " << QuotePsSingle(fmt.volLabel);
-            }
-            script << L" -Confirm:$false -Force";
-            if (!fmt.quick) {
-                script << L" -Full";
-            }
-            script << L" | Out-Null\n";
-        }
-    }
-
-    return script.str();
-}
-
-int RunPowerShell(const std::wstring& script) {
-    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
-    HANDLE readPipe = nullptr;
-    HANDLE writePipe = nullptr;
-
-    if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) {
-        throw std::runtime_error("CreatePipe failed.");
-    }
-    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
-
-    std::wstring cmdline = L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command " + QuotePsSingle(script);
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = writePipe;
-    si.hStdError = writePipe;
-
-    PROCESS_INFORMATION pi{};
-    std::vector<wchar_t> mutableCmd(cmdline.begin(), cmdline.end());
-    mutableCmd.push_back(L'\0');
-
-    if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        CloseHandle(readPipe);
-        CloseHandle(writePipe);
-        throw std::runtime_error("Failed to start powershell.exe.");
-    }
-
-    CloseHandle(writePipe);
-
-    std::string output;
-    char buffer[4096];
-    DWORD bytesRead = 0;
-    while (ReadFile(readPipe, buffer, sizeof(buffer), &bytesRead, nullptr) && bytesRead > 0) {
-        output.append(buffer, buffer + bytesRead);
-    }
-
-    CloseHandle(readPipe);
-
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-
-    if (!output.empty()) {
-        std::cout << output;
-    }
-
-    return static_cast<int>(exitCode);
-}
-
-void Usage() {
-    std::wcout << L"Usage:\n"
-               << L"  disk_part_fmt --disk=1 --gpt \\\n"
-               << L"    --create-part=size=10G,label=MyPart,type=basic \\\n"
-               << L"    --format=fs=ntfs,vol=Data,quick=1\n";
-}
-
-} // namespace
-
-int wmain(int argc, wchar_t** argv) {
-    if (argc <= 1) {
-        Usage();
-        return 1;
-    }
-
+int main(int argc, char* argv[]) {
+    int diskIdx = 2; // 默认测试磁盘 2
     try {
-        const auto opt = ParseArgs(argc, argv);
-        const std::wstring script = BuildSmapiScript(opt);
+        StorageManager sm;
+        sm.Connect();
+        MI_Instance* disk = sm.GetDisk(diskIdx);
 
-        std::wcout << L"Using Storage Management API (SMAPI) via PowerShell Storage module...\n";
-        const int exitCode = RunPowerShell(script);
-        if (exitCode != 0) {
-            std::wstringstream ss;
-            ss << L"PowerShell exited with code " << exitCode;
-            throw std::runtime_error(WideToUtf8(ss.str()));
-        }
+        sm.ClearDisk(disk); // 先清理
+        this_thread::sleep_for(chrono::seconds(1)); // 给系统一点反应时间
 
-        std::wcout << L"Done.\n";
-        return 0;
+        MI_Instance* part = sm.CreatePartition(disk, 0); // 0 代表使用最大可用空间
+        sm.FormatPartition(part, L"NTFS", L"WORK_DATA");
+
+        cout << "\n[Success] Disk " << diskIdx << " has been partitioned and formatted." << endl;
+        MI_Instance_Delete(disk); MI_Instance_Delete(part);
     }
-    catch (const std::exception& ex) {
-        std::cerr << "Error: " << ex.what() << "\n";
-        return 2;
+    catch (const exception& e) {
+        cerr << "\n[Fatal] " << e.what() << endl;
+        return -1;
     }
+    return 0;
 }
